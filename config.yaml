@@ -1,0 +1,103 @@
+# IBO on UrbanWind: the setting of the paper's main table.
+# Every tunable lives here; src/config.py documents each field.
+
+seed: 42
+
+data:
+  raw_pt_dir: data/raw                   # flat directory of <estate>_<dir>.pt cases
+  work_dir: work                         # caches, manifests and runs live below
+  coord_divisor: 550.0                   # positions are divided by 550 m
+  # WHICH ESTATES: a pool manifest (set here or with `--manifest`)
+  pool_manifest_path: null
+  # WHICH PACKS: derived from the model / preprocess settings
+  # ({work_dir}/cache_estate/<cache_key>_<partition>[_sf]_v1)
+  cache_estate_dir: null
+  norm_stats_path: null
+
+model:
+  latent_dim: 384                        # token width D
+  head_dim: 32                           # -> 12 processor heads
+  pn_out_dim: 256                        # PointNet 13 -> 64 -> 256
+  decoder_dh: 192                        # decoder width
+  decoder_n_heads: 6
+  decoder_register_attn: false
+  decoder_xy_fourier_abs: true
+  n_register: 0
+  n_vit_layers: 12
+  n_leaves: 16384                        # latent tokens L = 2^14
+  n_pn_neighbors: 32                     # PointNet members per leaf
+  idw_k: 8                               # decoder neighbours k
+  cache_idw_k: 16
+  global_cond_dim: 5                     # morphology conditioners
+  adaln_hidden: 64
+  fourier_freqs_xy: 8
+  fourier_freqs_z: 6
+  dropout: 0.1
+  rope_base: [450.0, 450.0, 64.0]
+  rope_dims: [12, 12, 8]
+  rope_scale_xy: 500.0
+  rope_scale_z: 500.0
+  disable_unet_skips: true
+  disable_decoder_stage1: true           # one decoder stage, reading the processor
+  disable_adaln: false
+
+preprocess:
+  n_workers: 32                          # multiprocessing pool size
+  dbscan_eps: 5.0
+  dbscan_min_samples: 10
+  wall_nz_threshold: 0.3
+  concave_hull_ratio: 0.3
+  dp_tol: 0.5
+  min_edge_collapse: 1.0
+  wind_direction: [0.0, -1.0]            # mean flow along -y
+  wind_face_dot_threshold: 0.3
+  threshold_edge: 0.5
+  near_building_sdf_threshold: 10.0
+  near_ground_z_threshold: 4.0
+  kdtree_weighting: invsqrt              # invsqrt | equal | structured
+  invsqrt_floor: 2.0                     # metres
+  grid_dims: [32, 32, 16]                # structured partition only
+  pn_surf_first: true
+  support_max: 550.0
+  geom_chunk: 16384
+  anomaly_concordance_threshold: 5.0
+  anomaly_extreme_threshold: 8.0
+  sdf_qc: true
+
+training:
+  num_epochs: 400
+  batch_size: 1
+  n_query: 128000                        # queries per case and step
+  lr_base: 2.0e-4                        # Lion peak learning rate
+  weight_decay_base: 0.01
+  lr_schedule: cosine
+  warmup_fraction: 0.05
+  warmup_steps: 8000
+  min_lr_fraction: 0.10
+  wsd_stable_fraction: 0.70
+  lr_schedule_ref_epochs: null
+  max_grad_norm: 1.0
+  mirror_augment: false
+  loss_vol_weights: [2.0, 1.0, 2.0, 1.0, 1.0]   # Ux, Uy, Uz, p, nut
+  loss_shape: mse
+  huber_delta: 1.75
+  swa_enabled: true
+  swa_fraction: 0.25                     # average the last quarter of epochs
+  compile_mode: reduce-overhead
+  num_workers: 8
+  prefetch_factor: 4
+
+checkpoint:
+  save_dir: work/runs/default
+  rolling_keep: 3
+
+evaluation:
+  test_chunk_size: 262144
+
+profiling:
+  first_window: [10, 30]
+  periodic_every: 5000
+  periodic_len: 10
+
+hardware:
+  profile: a100

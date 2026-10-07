@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# data, caches, runs and outputs stay outside version control
+data/
+work/
+weights/
+outputs/
+timing/
+*.pt
+*.npz
+*.vtk
