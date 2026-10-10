@@ -1,34 +1,49 @@
 #!/usr/bin/env python
-"""Predict the wind field around a new estate with a trained IBO model.
+"""Predict the wind field around an estate with a trained IBO model.
 
     python predict_new_case.py --geometry examples/toy_estate.json \\
+        --weights <weights dir> --out outputs
+    python predict_new_case.py --raw-pt raw/my_estate_N.pt \\
         --weights <weights dir> --out outputs
 
 <weights dir> holds the three files of a trained run: swa_model.pt,
 config_used.yaml and norm_stats.json. No dataset or cache is needed.
 
-Input: a JSON file of 2.5D buildings (a footprint polygon extruded from the
-ground to its height), in metres, in the model frame: origin at the centre
-of the 1100 m x 1100 m domain, ground at z = 0, mean wind blowing toward -y.
+Two kinds of input:
 
-    {"name": "toy_estate",
-     "buildings": [{"footprint": [[x, y], [x, y], ...], "height": 45.0},
-                   ...]}
+--geometry  a JSON file of 2.5D buildings (a footprint polygon extruded from
+            the ground to its height), in metres, in the model frame: origin
+            at the centre of the 1100 m x 1100 m domain, ground at z = 0,
+            mean wind blowing toward -y.
 
-For another wind direction, rotate the footprints so that the wind blows
-toward -y. Footprints are simple polygons (holes are ignored); buildings
-may extend beyond the domain and are cut at its edge.
+                {"name": "toy_estate",
+                 "buildings": [{"footprint": [[x, y], [x, y], ...],
+                                "height": 45.0}, ...]}
+
+            For another wind direction, rotate the footprints so that the
+            wind blows toward -y. Footprints are simple polygons (holes are
+            ignored); buildings may extend beyond the domain and are cut at
+            its edge. The points are placed like the CFD mesh's.
+
+--raw-pt    a raw UrbanWind case file (<estate>_<dir>.pt: the output of
+            convert_cfd_case.py, or a file of the dataset). The prediction
+            is made at the file's own points, with the building footprints
+            extracted from its surface points as the dataset preprocessing
+            does, and scored against the file's CFD fields.
 
 Steps:
-  1. mesh      Points placed like the cell centres of the UrbanWind CFD mesh:
-               the blockMesh z layers (graded 50:1 up to six times the
-               reference height H, the tallest building rounded up to 10 m),
-               the snappyHexMesh horizontal refinement boxes (3.125 m below
-               1.5 H, doubling at 2 H, 2.5 H, 3 H and 3.5 H, 100 m above),
-               cells inside buildings removed, and the first cell layer
-               snapped onto the building surfaces. Surface points are the
-               projections of that first layer onto the buildings. Both are
-               cropped to |x|, |y| <= 550 m and z <= 160 m.
+  1. points    --geometry: the vertices of the UrbanWind CFD mesh: the
+               blockMesh z layers (graded 50:1 up to six times the reference
+               height H, the tallest building rounded up to 10 m), the
+               snappyHexMesh horizontal refinement boxes (3.125 m below
+               1.5 H, doubling at 2 H, 2.5 H, 3 H and 3.5 H, 100 m above);
+               the vertices of cells inside buildings are removed unless a
+               fluid cell shares them, in which case they are snapped onto
+               the building surface. Surface points are the wall faces of
+               the first cell layer, placed by projecting its cell centres
+               onto the buildings. Both are cropped to |x|, |y| <= 550 m and
+               z <= 160 m.
+               --raw-pt: the file's volume and surface points.
   2. features  Signed distance, ray support, surface normals, region codes
                and morphology from the 2.5D geometry, with the same code and
                settings as the training data (src/preprocess).
@@ -38,7 +53,10 @@ Steps:
                swa_model.pt; CUDA when available, else CPU.
   5. output    <out>/<name>.npz and legacy VTK point clouds of the volume and
                surface predictions (<name>_volume.vtk, <name>_surface.vtk),
-               in the model frame.
+               in the model frame. With --raw-pt, both also carry the CFD
+               fields, and <name>_metrics.json holds the paper's metrics: the
+               relative L2 error of every channel in physical units and the
+               z-score MSE.
 """
 from src.utils import env  # noqa: F401  (must precede torch import)
 
@@ -60,19 +78,21 @@ from src.data.estate import (SURF_CHANNEL_NAMES, VOL_CHANNEL_NAMES,
                              knn_query)
 from src.evaluation.metrics import (inverse_transform_surf,
                                     inverse_transform_vol, load_norm_stats)
-from src.evaluation.test_worker import infer_case
+from src.evaluation.test_worker import infer_case, metrics_from_predictions
 from src.model.full_model import IBO
+from src.preprocess.build import load_raw_case
 from src.preprocess.features import (build_latent_layout, classify_edges,
                                      morph_raw, surface_normals_and_dims,
                                      volume_region_dim2)
-from src.preprocess.geometry import (Extrusion25D, canonical_footprint,
+from src.preprocess.geometry import (Extrusion25D, FootprintQCError,
+                                     canonical_footprint, extract_buildings,
                                      point_in_polygon)
 from src.training.checkpoint import load_state_strict
 
 WEIGHT_FILES = ("swa_model.pt", "config_used.yaml", "norm_stats.json")
 
-DOMAIN_HALF = 550.0      # output domain: |x|, |y| <= 550 m (cell centres)
-DOMAIN_TOP = 160.0       # output domain: z <= 160 m (cell centres)
+DOMAIN_HALF = 550.0      # output domain: |x|, |y| <= 550 m (mesh vertices)
+DOMAIN_TOP = 160.0       # output domain: z <= 160 m (mesh vertices)
 GRADING = 50.0           # blockMesh simpleGrading in z (last / first layer)
 BACKGROUND_CELL = 100.0  # blockMesh horizontal cell size, metres
 # snappyHexMesh refinement boxes: (top height in units of H, horizontal
@@ -171,7 +191,7 @@ def read_weights(weights_dir: Path):
 
 
 # ---------------------------------------------------------------------------
-# Step 1: the CFD-like point set
+# Step 1 (--geometry): the CFD-like point set
 # ---------------------------------------------------------------------------
 
 def reference_height(heights: np.ndarray) -> float:
@@ -235,53 +255,87 @@ def bbox_distance(pts: np.ndarray, polys: list[np.ndarray],
 
 def build_mesh(polys: list[np.ndarray], heights: np.ndarray, height: float,
                chunk: int) -> dict:
-    """Volume points (snapped cell centres), surface points and the index of
+    """Volume points (the vertices of the castellated and snapped mesh),
+    surface points (the wall faces of the first cell layer) and the index of
     the building each surface point lies on."""
     bounds = z_layers(height)
-    centres, half, layers = [], [], []
+    layers = []                       # (lo, hi, horizontal cell) below the top
     for lo, hi in zip(bounds[:-1], bounds[1:]):
         if lo >= DOMAIN_TOP:
             break
-        zc = 0.5 * (lo + hi)
-        d = horizontal_cell(zc, height)
-        # one extra cell beyond the domain edge: snapping may move it inside
-        n = int(math.ceil((DOMAIN_HALF + d) / d))
-        axis = (np.arange(-n, n) + 0.5) * d
-        axis = axis[np.abs(axis) <= DOMAIN_HALF + d]
-        gx, gy = np.meshgrid(axis, axis, indexing="ij")
-        centres.append(np.stack([gx.ravel(), gy.ravel(),
-                                 np.full(gx.size, zc)], axis=1))
-        half.append(np.tile([0.5 * d, 0.5 * d, 0.5 * (hi - lo)],
-                            (gx.size, 1)))
-        layers.append((float(lo), float(hi), d))
-    centres = np.concatenate(centres)
-    half = np.concatenate(half)
-
-    # castellation: cells whose centre is inside a building are removed
-    keep = ~inside_buildings(centres, polys, heights)
-
-    # snapping: a cell whose centre lies within twice its half-extent h of a
-    # building surface (along the direction to that surface) is the first
-    # cell layer; its near face moves onto the surface, so its centre moves
-    # to distance (s + h) / 2. Its surface face is the projection of the
-    # original centre onto the surface.
+        layers.append((float(lo), float(hi),
+                       horizontal_cell(0.5 * (lo + hi), height)))
     scene = Extrusion25D(polys, np.zeros(len(polys)), heights)
-    near = np.flatnonzero(keep & (bbox_distance(centres, polys, heights)
-                                  <= 2.0 * np.linalg.norm(half, axis=1)))
-    s, sdir, bld = scene.sdf(centres[near], chunk=chunk, return_building=True)
-    h = (half[near] * np.abs(sdir)).sum(axis=1)
-    keep[near[s <= 1e-6]] = False          # centre on a surface: degenerate
-    first = (s > 1e-6) & (s <= 2.0 * h)
-    idx = near[first]
-    surf_pos = centres[idx] - s[first, None] * sdir[first]
-    surf_bld = bld[first]
-    centres[idx] += (0.5 * (h[first] - s[first]))[:, None] * sdir[first]
 
-    vol_pos = centres[keep]
+    # Vertices lie on every layer boundary up to the domain top, on the
+    # lattice i d of the finer of the two layers the boundary separates (the
+    # hanging nodes of a refinement interface belong to the fine layer).
+    # Castellation keeps a vertex outside the buildings, and a vertex inside
+    # one when a cell around it has a fluid centre; snapping then moves those
+    # inside vertices onto the building surface.
+    vol_parts, n_snapped = [], 0
+    for k in range(len(layers) + 1):
+        z = float(bounds[k])
+        if z > DOMAIN_TOP:
+            break
+        around = [lay for lay in (layers[k - 1] if k >= 1 else None,
+                                  layers[k] if k < len(layers) else None)
+                  if lay is not None]
+        d = min(lay[2] for lay in around)
+        n = int(math.floor(DOMAIN_HALF / d + 1e-9))
+        axis = np.arange(-n, n + 1) * d
+        gx, gy = np.meshgrid(axis, axis, indexing="ij")
+        v = np.column_stack([gx.ravel(), gy.ravel(), np.full(gx.size, z)])
+        inside = inside_buildings(v, polys, heights)
+        keep = ~inside
+        idx = np.flatnonzero(inside)
+        if len(idx):
+            probes = []
+            for lo, hi, dl in around:
+                zc = 0.5 * (lo + hi)
+                for sx in (-0.5, 0.5):
+                    for sy in (-0.5, 0.5):
+                        probes.append(v[idx] + np.array([sx * dl, sy * dl,
+                                                         zc - z]))
+            probes = np.stack(probes, axis=1)                # [m, cells, 3]
+            fluid = ~inside_buildings(probes.reshape(-1, 3), polys, heights)
+            snap = idx[fluid.reshape(len(idx), -1).any(axis=1)]
+            if len(snap):
+                s, sdir = scene.sdf(v[snap], chunk=chunk)
+                v[snap] -= np.abs(s)[:, None] * sdir
+                keep[snap] = True
+                n_snapped += len(snap)
+        vol_parts.append(v[keep])
+    vol_pos = np.concatenate(vol_parts)
     in_domain = (np.abs(vol_pos[:, 0]) <= DOMAIN_HALF) \
         & (np.abs(vol_pos[:, 1]) <= DOMAIN_HALF) \
         & (vol_pos[:, 2] <= DOMAIN_TOP)
     vol_pos = vol_pos[in_domain]
+
+    # Surface points: a cell whose centre lies within twice its half-extent
+    # of a building surface (along the direction to that surface) belongs to
+    # the first cell layer; its wall face sits where the centre projects
+    # onto the surface.
+    centres, half = [], []
+    for lo, hi, d in layers:
+        n = int(math.ceil((DOMAIN_HALF + d) / d))
+        axis = (np.arange(-n, n) + 0.5) * d
+        axis = axis[np.abs(axis) <= DOMAIN_HALF + d]
+        gx, gy = np.meshgrid(axis, axis, indexing="ij")
+        centres.append(np.column_stack([gx.ravel(), gy.ravel(),
+                                        np.full(gx.size, 0.5 * (lo + hi))]))
+        half.append(np.tile([0.5 * d, 0.5 * d, 0.5 * (hi - lo)],
+                            (gx.size, 1)))
+    centres = np.concatenate(centres)
+    half = np.concatenate(half)
+    fluid = ~inside_buildings(centres, polys, heights)
+    near = np.flatnonzero(fluid & (bbox_distance(centres, polys, heights)
+                                   <= 2.0 * np.linalg.norm(half, axis=1)))
+    s, sdir, bld = scene.sdf(centres[near], chunk=chunk, return_building=True)
+    h = (half[near] * np.abs(sdir)).sum(axis=1)
+    first = (s > 1e-6) & (s <= 2.0 * h)
+    surf_pos = centres[near[first]] - s[first, None] * sdir[first]
+    surf_bld = bld[first]
 
     # one point per surface position, inside the domain
     _, uniq = np.unique(np.round(surf_pos, 6), axis=0, return_index=True)
@@ -292,12 +346,8 @@ def build_mesh(polys: list[np.ndarray], heights: np.ndarray, height: float,
         & (surf_pos[:, 2] <= DOMAIN_TOP)
     return {"vol_pos": vol_pos, "surf_pos": surf_pos[in_domain],
             "surf_bld": surf_bld[in_domain], "layers": layers,
-            "n_snapped": int(first.sum()), "scene": scene}
+            "n_snapped": n_snapped, "scene": scene}
 
-
-# ---------------------------------------------------------------------------
-# Steps 2 and 3: features and latent layout
-# ---------------------------------------------------------------------------
 
 def domain_footprints(polys: list[np.ndarray], heights: np.ndarray,
                       pp: PreprocessConfig):
@@ -321,51 +371,38 @@ def domain_footprints(polys: list[np.ndarray], heights: np.ndarray,
     return fps, np.asarray(z_hi, dtype=np.float64), index
 
 
-def prepare_case(name: str, polys: list[np.ndarray], heights: np.ndarray,
-                 mcfg: ModelConfig, pp: PreprocessConfig, stats: dict
-                 ) -> tuple[dict, dict]:
+# ---------------------------------------------------------------------------
+# Steps 2 and 3: features and latent layout
+# ---------------------------------------------------------------------------
+
+def prepare_features(name: str, vol_pos: np.ndarray, surf_pos: np.ndarray,
+                     surf_bld: np.ndarray, fps: list[np.ndarray],
+                     z_lo: np.ndarray, z_hi: np.ndarray, inside_sdf,
+                     mcfg: ModelConfig, pp: PreprocessConfig, stats: dict
+                     ) -> tuple[dict, np.ndarray]:
     """The model input dict (the layout and dtypes of an estate pack, as
-    evaluation reads it) and the physical positions for the outputs."""
+    evaluation reads it) and the surface normals, from physical positions
+    and the 2.5D buildings (footprints with their z ranges; surf_bld is the
+    footprint index of each surface point).
+
+    A volume point inside a footprint is fluid the 2.5D geometry fills (an
+    open ground floor, a stepped roof); inside_sdf(idx) returns the distance
+    of those points to the true geometry and its unit direction, used where
+    the distance is positive, |sdf| otherwise."""
     cd = float(stats["coord_divisor"])
     chunk = int(pp.geom_chunk)
     wind = np.asarray(pp.wind_direction, dtype=np.float64)
     wind = wind / np.linalg.norm(wind)
-
-    t0 = time.time()
-    height = reference_height(heights)
-    mesh = build_mesh(polys, heights, height, chunk)
-    fine = [lay for lay in mesh["layers"] if lay[2] == REFINEMENT_BOXES[0][1]]
-    log(f"[mesh] H = {height:.0f} m (tallest building {heights.max():.1f} m), "
-        f"{len(mesh['layers'])} z layers start below {DOMAIN_TOP:.0f} m "
-        f"(first {mesh['layers'][0][1]:.2f} m thick), "
-        f"{len(fine)} of them at {REFINEMENT_BOXES[0][1]} m horizontally")
-    log(f"[mesh] {len(mesh['vol_pos']):,} volume points "
-        f"({mesh['n_snapped']:,} snapped), {len(mesh['surf_pos']):,} "
-        f"surface points ({time.time() - t0:.0f} s)")
-
-    t0 = time.time()
-    fps, z_hi, index = domain_footprints(polys, heights, pp)
-    if not fps:
-        raise SystemExit("no building inside the 1100 m x 1100 m domain")
-    z_lo = np.zeros(len(fps))
-    scene = Extrusion25D(fps, z_lo, z_hi)
-
-    surf_bld = index[mesh["surf_bld"]]
-    on_domain_bld = surf_bld >= 0
-    surf_pos = mesh["surf_pos"][on_domain_bld]
-    surf_bld = surf_bld[on_domain_bld]
-    vol_pos = mesh["vol_pos"]
     n_vol, n_surf = len(vol_pos), len(surf_pos)
     if n_surf == 0:
         raise SystemExit("no building surface inside the domain")
 
-    # Signed distance to the 2.5D buildings. A volume point inside a
-    # (simplified) footprint takes its distance to the input geometry and
-    # that direction, or |sdf| where those are unusable.
+    t0 = time.time()
+    scene = Extrusion25D(fps, z_lo, z_hi)
     sdf_vol, dir_vol = scene.sdf(vol_pos, chunk=chunk)
     inside = np.flatnonzero(sdf_vol < 0)
     if len(inside):
-        r_sdf, r_dir = mesh["scene"].sdf(vol_pos[inside], chunk=chunk)
+        r_sdf, r_dir = inside_sdf(inside)
         use = (r_sdf > 0) & (np.linalg.norm(r_dir, axis=1) > 1e-6)
         sdf_vol[inside] = np.where(use, r_sdf, np.abs(sdf_vol[inside]))
         dir_vol[inside[use]] = r_dir[use]
@@ -390,7 +427,7 @@ def prepare_case(name: str, polys: list[np.ndarray], heights: np.ndarray,
     morph_norm = (morph - np.asarray(stats["morph_mean"], dtype=np.float64)) \
         / np.maximum(np.asarray(stats["morph_std"], dtype=np.float64), 1e-8)
     log(f"[features] {len(fps)} buildings in the domain, "
-        f"{len(inside):,} volume points inside a simplified footprint "
+        f"{len(inside):,} volume points inside a footprint "
         f"({time.time() - t0:.0f} s)")
 
     t0 = time.time()
@@ -436,10 +473,150 @@ def prepare_case(name: str, polys: list[np.ndarray], heights: np.ndarray,
         "pn_mask": torch.from_numpy(layout["pn_mask"]),
         "global_morph_norm": torch.from_numpy(morph_norm.astype(np.float32)),
     }
+    return case, surf_normal
+
+
+def _layer_bounds(height: float) -> np.ndarray:
+    bounds = z_layers(height)
+    return np.array([[lo, hi] for lo, hi in zip(bounds[:-1], bounds[1:])
+                     if lo < DOMAIN_TOP])
+
+
+def prepare_case(name: str, polys: list[np.ndarray], heights: np.ndarray,
+                 mcfg: ModelConfig, pp: PreprocessConfig, stats: dict
+                 ) -> tuple[dict, dict]:
+    """--geometry: the CFD-like point set of the buildings, the model input
+    and the physical positions for the outputs."""
+    chunk = int(pp.geom_chunk)
+    t0 = time.time()
+    height = reference_height(heights)
+    mesh = build_mesh(polys, heights, height, chunk)
+    fine = [lay for lay in mesh["layers"] if lay[2] == REFINEMENT_BOXES[0][1]]
+    log(f"[mesh] H = {height:.0f} m (tallest building {heights.max():.1f} m), "
+        f"{len(mesh['layers'])} z layers start below {DOMAIN_TOP:.0f} m "
+        f"(first {mesh['layers'][0][1]:.2f} m thick), "
+        f"{len(fine)} of them at {REFINEMENT_BOXES[0][1]} m horizontally")
+    log(f"[mesh] {len(mesh['vol_pos']):,} volume points "
+        f"({mesh['n_snapped']:,} snapped onto buildings), "
+        f"{len(mesh['surf_pos']):,} surface points ({time.time() - t0:.0f} s)")
+
+    fps, z_hi, index = domain_footprints(polys, heights, pp)
+    if not fps:
+        raise SystemExit("no building inside the 1100 m x 1100 m domain")
+    z_lo = np.zeros(len(fps))
+    surf_bld = index[mesh["surf_bld"]]
+    on_domain_bld = surf_bld >= 0
+    surf_pos = mesh["surf_pos"][on_domain_bld]
+    surf_bld = surf_bld[on_domain_bld]
+    vol_pos = mesh["vol_pos"]
+
+    def inside_sdf(idx):
+        return mesh["scene"].sdf(vol_pos[idx], chunk=chunk)
+
+    case, surf_normal = prepare_features(
+        name, vol_pos, surf_pos, surf_bld, fps, z_lo, z_hi, inside_sdf,
+        mcfg, pp, stats)
     geo = {"vol_pos": vol_pos, "surf_pos": surf_pos,
            "surf_normal": surf_normal, "surf_building": surf_bld,
            "footprints": fps, "z_hi": z_hi, "height": height,
            "layer_bounds": np.array([lay[:2] for lay in mesh["layers"]])}
+    return case, geo
+
+
+def assign_surface_buildings(surf_pos: np.ndarray, fps: list[np.ndarray],
+                             pp: PreprocessConfig) -> np.ndarray:
+    """Surface point -> footprint index, as the dataset preprocessing does
+    it: DBSCAN clusters matched to the nearest footprint centroid, noise
+    points to the nearest centroid."""
+    from sklearn.cluster import DBSCAN
+
+    labels = DBSCAN(eps=pp.dbscan_eps, min_samples=pp.dbscan_min_samples
+                    ).fit_predict(surf_pos[:, :2])
+    ids = sorted(set(int(l) for l in labels) - {-1})
+    tree = cKDTree(np.array([fp.mean(axis=0) for fp in fps]))
+    surf_bld = np.zeros(len(surf_pos), dtype=np.int64)
+    if ids:
+        centroids = np.array([surf_pos[labels == l, :2].mean(axis=0)
+                              for l in ids])
+        alignment = tree.query(centroids)[1]
+        label_to_bi = {lab: int(alignment[i]) for i, lab in enumerate(ids)}
+        surf_bld = np.array([label_to_bi.get(int(l), 0) for l in labels],
+                            dtype=np.int64)
+    noise = labels == -1
+    if noise.any():
+        surf_bld[noise] = tree.query(surf_pos[noise, :2])[1]
+    return surf_bld
+
+
+def zscored_targets(raw, stats: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    """The file's CFD fields as the training targets: detrended
+    (Uy -= c ln max(z, z0), p += g z) and z-scored."""
+    z = raw.volume_pos[:, 2]
+    tv = raw.volume_fields.astype(np.float64).copy()
+    tv[:, 1] -= stats["detrend_uy_coeff"] * np.log(
+        np.maximum(z, stats["detrend_z_floor"]))
+    tv[:, 3] += stats["detrend_p_coeff"] * z
+    ts = raw.surface_fields[:, 0:1].astype(np.float64).copy()
+    ts[:, 0] += stats["detrend_p_coeff"] * raw.surface_pos[:, 2]
+    vol_mean = np.asarray(stats["vol_mean"], dtype=np.float64)
+    vol_std = np.maximum(np.asarray(stats["vol_std"], dtype=np.float64), 1e-8)
+    surf_mean = np.asarray(stats["surf_mean"], dtype=np.float64)
+    surf_std = np.maximum(np.asarray(stats["surf_std"], dtype=np.float64),
+                          1e-8)
+    return (torch.from_numpy(((tv - vol_mean) / vol_std).astype(np.float32)),
+            torch.from_numpy(((ts - surf_mean) / surf_std).astype(np.float32)))
+
+
+def prepare_raw_case(path: Path, mcfg: ModelConfig, pp: PreprocessConfig,
+                     stats: dict) -> tuple[dict, dict]:
+    """--raw-pt: the model input at the file's own points, its targets for
+    the metrics, and the positions and CFD fields for the outputs."""
+    try:
+        raw = load_raw_case(path)
+    except Exception as exc:  # noqa: BLE001 — any unreadable file is fatal
+        raise SystemExit(f"{path}: not a raw UrbanWind case ({exc})")
+    name = raw.case_name
+    log(f"[input] {name}: {raw.n_vol:,} volume points, {raw.n_surf:,} "
+        f"surface points")
+
+    t0 = time.time()
+    try:
+        buildings = extract_buildings(
+            raw.surface_pos, raw.surface_normals,
+            dbscan_eps=pp.dbscan_eps, dbscan_min_samples=pp.dbscan_min_samples,
+            wall_nz_threshold=pp.wall_nz_threshold,
+            hull_ratio=pp.concave_hull_ratio, dp_tol=pp.dp_tol,
+            min_edge=pp.min_edge_collapse)
+    except FootprintQCError as exc:
+        raise SystemExit(f"{name}: footprint extraction from the surface "
+                         f"points failed ({exc})")
+    fps = [b.footprint for b in buildings]
+    z_lo = np.array([b.z_lo for b in buildings], dtype=np.float64)
+    z_hi = np.array([b.z_hi for b in buildings], dtype=np.float64)
+    surf_bld = assign_surface_buildings(raw.surface_pos, fps, pp)
+    log(f"[footprints] {len(fps)} buildings extracted from the surface "
+        f"points, roofs {z_hi.min():.1f}-{z_hi.max():.1f} m "
+        f"({time.time() - t0:.0f} s)")
+
+    def inside_sdf(idx):
+        g = raw.volume_sdf_grad[idx].astype(np.float64)
+        gn = np.linalg.norm(g, axis=1, keepdims=True)
+        return (raw.volume_sdf[idx].astype(np.float64),
+                np.where(gn > 1e-6, g / np.maximum(gn, 1e-12), 0.0))
+
+    case, surf_normal = prepare_features(
+        name, raw.volume_pos, raw.surface_pos, surf_bld, fps, z_lo, z_hi,
+        inside_sdf, mcfg, pp, stats)
+    case["target_vol"], case["target_surf"] = zscored_targets(raw, stats)
+    case["query_z_phys"] = torch.from_numpy(np.concatenate(
+        [raw.volume_pos[:, 2], raw.surface_pos[:, 2]]).astype(np.float32))
+    height = reference_height(z_hi)
+    geo = {"vol_pos": raw.volume_pos, "surf_pos": raw.surface_pos,
+           "surf_normal": surf_normal, "surf_building": surf_bld,
+           "footprints": fps, "z_hi": z_hi, "height": height,
+           "layer_bounds": _layer_bounds(height),
+           "vol_true": raw.volume_fields.astype(np.float64),
+           "surf_true": raw.surface_fields[:, 0:1].astype(np.float64)}
     return case, geo
 
 
@@ -493,26 +670,37 @@ def write_vtk_points(path: Path, points: np.ndarray, fields: dict,
 
 def save_outputs(out_dir: Path, name: str, geo: dict, vol: np.ndarray,
                  surf: np.ndarray) -> list[Path]:
+    """<name>.npz and the two VTK point clouds; with CFD fields in geo
+    (--raw-pt) those go in as well, as *_cfd."""
     out_dir.mkdir(parents=True, exist_ok=True)
+    arrays = {
+        "volume_pos": geo["vol_pos"].astype(np.float32),
+        "volume_fields": vol.astype(np.float32),
+        "volume_channels": np.array(VOL_CHANNEL_NAMES),
+        "surface_pos": geo["surf_pos"].astype(np.float32),
+        "surface_normal": geo["surf_normal"].astype(np.float32),
+        "surface_fields": surf.astype(np.float32),
+        "surface_channels": np.array(SURF_CHANNEL_NAMES),
+        "surface_building": geo["surf_building"].astype(np.int32),
+        "reference_height": np.float64(geo["height"]),
+        "layer_bounds": geo["layer_bounds"],
+    }
+    vol_fields = {"U": vol[:, 0:3], "p": vol[:, 3], "nut": vol[:, 4]}
+    surf_fields = {"p": surf[:, 0], "normal": geo["surf_normal"]}
+    if geo.get("vol_true") is not None:
+        vt, st = geo["vol_true"], geo["surf_true"]
+        arrays["volume_fields_cfd"] = vt.astype(np.float32)
+        arrays["surface_fields_cfd"] = st.astype(np.float32)
+        vol_fields.update({"U_cfd": vt[:, 0:3], "p_cfd": vt[:, 3],
+                           "nut_cfd": vt[:, 4]})
+        surf_fields["p_cfd"] = st[:, 0]
     npz = out_dir / f"{name}.npz"
-    np.savez(npz,
-             volume_pos=geo["vol_pos"].astype(np.float32),
-             volume_fields=vol.astype(np.float32),
-             volume_channels=np.array(VOL_CHANNEL_NAMES),
-             surface_pos=geo["surf_pos"].astype(np.float32),
-             surface_normal=geo["surf_normal"].astype(np.float32),
-             surface_fields=surf.astype(np.float32),
-             surface_channels=np.array(SURF_CHANNEL_NAMES),
-             surface_building=geo["surf_building"].astype(np.int32),
-             reference_height=np.float64(geo["height"]),
-             layer_bounds=geo["layer_bounds"])
+    np.savez(npz, **arrays)
     vtk_vol = out_dir / f"{name}_volume.vtk"
-    write_vtk_points(vtk_vol, geo["vol_pos"],
-                     {"U": vol[:, 0:3], "p": vol[:, 3], "nut": vol[:, 4]},
+    write_vtk_points(vtk_vol, geo["vol_pos"], vol_fields,
                      f"{name} volume (IBO prediction, model frame)")
     vtk_surf = out_dir / f"{name}_surface.vtk"
-    write_vtk_points(vtk_surf, geo["surf_pos"],
-                     {"p": surf[:, 0], "normal": geo["surf_normal"]},
+    write_vtk_points(vtk_surf, geo["surf_pos"], surf_fields,
                      f"{name} surface (IBO prediction, model frame)")
     return [npz, vtk_vol, vtk_surf]
 
@@ -521,8 +709,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--geometry", required=True,
-                    help="buildings JSON (see above)")
+    source = ap.add_mutually_exclusive_group(required=True)
+    source.add_argument("--geometry", help="buildings JSON (see above)")
+    source.add_argument("--raw-pt",
+                        help="raw UrbanWind case file: predict at its points "
+                             "and score against its CFD fields")
     ap.add_argument("--weights", required=True,
                     help="directory with swa_model.pt, config_used.yaml and "
                          "norm_stats.json")
@@ -531,11 +722,15 @@ def main() -> int:
 
     weights_dir = Path(args.weights).expanduser()
     mcfg, pp, stats = read_weights(weights_dir)
-    name, polys, heights = read_geometry(Path(args.geometry).expanduser())
-    log(f"[input] {name}: {len(polys)} buildings, heights "
-        f"{heights.min():.1f}-{heights.max():.1f} m")
-
-    case, geo = prepare_case(name, polys, heights, mcfg, pp, stats)
+    if args.geometry:
+        name, polys, heights = read_geometry(Path(args.geometry).expanduser())
+        log(f"[input] {name}: {len(polys)} buildings, heights "
+            f"{heights.min():.1f}-{heights.max():.1f} m")
+        case, geo = prepare_case(name, polys, heights, mcfg, pp, stats)
+    else:
+        case, geo = prepare_raw_case(Path(args.raw_pt).expanduser(), mcfg, pp,
+                                     stats)
+        name = case["case_name"]
 
     t0 = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -544,8 +739,14 @@ def main() -> int:
     model = load_model(weights_dir, mcfg, device)
     pred_vol_z, pred_surf_z = infer_case(model, case, device, DECODE_CHUNK,
                                          use_bf16)
-    vol = inverse_transform_vol(pred_vol_z, geo["vol_pos"][:, 2], stats)
-    surf = inverse_transform_surf(pred_surf_z, geo["surf_pos"][:, 2], stats)
+    metrics = None
+    if "target_vol" in case:
+        metrics, vol, surf = metrics_from_predictions(name, case, stats,
+                                                      pred_vol_z, pred_surf_z)
+    else:
+        vol = inverse_transform_vol(pred_vol_z, geo["vol_pos"][:, 2], stats)
+        surf = inverse_transform_surf(pred_surf_z, geo["surf_pos"][:, 2],
+                                      stats)
     log(f"[model] {device.type}{' bf16' if use_bf16 else ' fp32'}, "
         f"{case['N_vol'] + case['N_surf']:,} points "
         f"({time.time() - t0:.0f} s)")
@@ -556,8 +757,18 @@ def main() -> int:
     log(f"[model] |U| {speed.min():.2f}-{speed.max():.2f} m/s "
         f"(mean {speed.mean():.2f}), p_surf {surf.min():.1f}-"
         f"{surf.max():.1f}")
-    for path in save_outputs(Path(args.out).expanduser(), name, geo, vol,
-                             surf):
+    out_dir = Path(args.out).expanduser()
+    paths = save_outputs(out_dir, name, geo, vol, surf)
+    if metrics is not None:
+        rl2 = metrics["relative_l2_physical"]
+        log("[metrics] relative L2 in physical units: "
+            + ", ".join(f"{k} {v:.3f}" for k, v in rl2["volume_channels"].items())
+            + f", p_surf {rl2['surface_channels']['p_surf']:.3f}")
+        metrics_path = out_dir / f"{name}_metrics.json"
+        metrics_path.write_text(json.dumps(metrics, indent=2),
+                                encoding="utf-8")
+        paths.append(metrics_path)
+    for path in paths:
         log(f"[output] {path}")
     return 0
 

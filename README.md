@@ -9,7 +9,11 @@ Meshes"** (ICLR 2027 submission). It contains:
 - the baselines we reproduced on UrbanWind under the same protocol:
   AB-UPT, Transolver-3, SpiderSolver and Erwin;
 - `predict_new_case.py`, which predicts the wind field around a new estate
-  from its building footprints and heights, using the trained weights.
+  from its building footprints and heights, using the trained weights, or
+  at the points of a CFD case and scores the prediction against it;
+- `convert_cfd_case.py`, which turns a CFD case (VTK files and an STL) into
+  a raw case file of the dataset's format, for scoring the model on new CFD
+  results or for training on them.
 
 The repository has two audiences. [Research](#research) covers the method,
 the results and how the experiments run. [Using the trained
@@ -127,7 +131,9 @@ U<sub>y</sub>, U<sub>z</sub>, p, ν<sub>t</sub>), `surface_pos`,
 `surface_fields` (p and the three wall-shear components; only p is used),
 `surface_normals`, `volume_sdf` and `volume_sdf_grad` (distance to the
 CFD geometry and its gradient). Set `data.raw_pt_dir` in `config.yaml` or
-pass `--raw-dir`.
+pass `--raw-dir`. The format is specified in
+[`docs/cfd_case_format.md`](docs/cfd_case_format.md), and
+`convert_cfd_case.py` produces it from VTK files.
 
 **Preprocessing** turns the raw cases into one pack per estate:
 
@@ -286,16 +292,20 @@ Units are those of the training data:
 
 **What the script does.** It needs no dataset and no cache:
 
-1. **Point set.** It places points where the cell centres of the UrbanWind
-   CFD mesh would be:
+1. **Point set.** It places points at the vertices of the UrbanWind CFD
+   mesh:
    - The reference height H is the tallest building rounded up to 10 m.
    - The z layers come from the blockMesh rule: top 6H, layers graded
-     50:1, first layer about 1 m.
+     50:1, first layer about 1 m. The points lie on the layer boundaries,
+     the ground plane z = 0 included.
    - Horizontal cells are 3.125 m up to 1.5H, then 6.25, 12.5, 25 and
-     50 m up to 2H, 2.5H, 3H and 3.5H, and 100 m above.
-   - Cells inside buildings are removed.
-   - The first cell layer is snapped onto the building surfaces, and the
-     surface points are its projections onto the buildings.
+     50 m up to 2H, 2.5H, 3H and 3.5H, and 100 m above. At a refinement
+     interface the points lie on the lattice of the finer layer.
+   - Cells inside buildings are removed, and their vertices with them,
+     except the vertices shared with a fluid cell, which are snapped onto
+     the building surface.
+   - The surface points are the wall faces of the first cell layer, placed
+     by projecting its cell centres onto the buildings.
    - Everything is cropped to |x|, |y| ≤ 550 m and z ≤ 160 m.
 2. **Features and latent layout.** It computes them with the same code and
    settings as the training data (`src/preprocess/`).
@@ -318,13 +328,39 @@ outside it:
   Other inflow speeds, terrain, non-extruded building shapes and geometry
   above 160 m are outside what it was trained on.
 
+### Running on your own CFD case
+
+`convert_cfd_case.py` turns a CFD case into a raw case file of the
+dataset's format, `<estate>_<dir>.pt`, and `predict_new_case.py --raw-pt`
+predicts at that file's points and scores the prediction against its CFD
+fields:
+
+```bash
+python convert_cfd_case.py --volume case/internal.vtu --surface case/boundary/buildings.vtp --stl case/buildings.stl --estate my_estate --direction N --out raw
+```
+
+```bash
+python predict_new_case.py --raw-pt raw/my_estate_N.pt --weights path/to/weights --out outputs
+```
+
+The converter needs the internal mesh with cell data U, p and ν<sub>t</sub>,
+the building wall patches with cell data p and wallShearStress, and a
+watertight STL of the buildings. It averages the cell values onto the mesh
+vertices, crops to the learning region, rotates the wind to −y, brings the
+pressure to the training convention, orients the wall normals, computes the
+signed distance to the STL and checks units and conventions.
+[`docs/cfd_case_format.md`](docs/cfd_case_format.md) specifies the input
+files, the output file and every convention, and how a folder of converted
+cases becomes training data.
+
 ---
 
 ## Repository layout
 
 ```
 main.py                  preprocess / releaf / manifest / derive / train / post
-predict_new_case.py      new estate -> point set -> features -> IBO -> outputs
+predict_new_case.py      new estate or raw case file -> features -> IBO -> outputs, metrics
+convert_cfd_case.py      CFD case (VTK files + STL) -> raw case file <estate>_<dir>.pt
 config.yaml              main-table setting of every model
 src/
   preprocess/            geometry (2.5D buildings), kdtree, features, build (dataset packs)
@@ -336,6 +372,7 @@ src/
   manifest.py            pool manifests (splits)
   registry.py            the --model menu
 examples/toy_estate.json example input for predict_new_case.py
+docs/cfd_case_format.md  the raw case file, the VTK inputs and the conversion
 Demo/                    IBO prediction figures from the paper (PDF and PNG)
 tools/                   wall-distance bins, stage timing
 tests/                   numerical equivalence tests
