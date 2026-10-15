@@ -11,9 +11,9 @@ Meshes"** (ICLR 2027 submission). It contains:
 - `predict_new_case.py`, which predicts the wind field around a new estate
   from its building footprints and heights, using the trained weights, or
   at the points of a CFD case and scores the prediction against it;
-- `convert_cfd_case.py`, which turns a CFD case (VTK files and an STL) into
-  a raw case file of the dataset's format, for scoring the model on new CFD
-  results or for training on them.
+- `npz_to_raw.py`, which turns CFD cases in the dataset's NPZ format into
+  the raw case files the preprocessing reads, for training on new cases or
+  for scoring the model on them.
 
 The repository has two audiences. [Research](#research) covers the method,
 the results and how the experiments run. [Using the trained
@@ -131,9 +131,9 @@ U<sub>y</sub>, U<sub>z</sub>, p, ν<sub>t</sub>), `surface_pos`,
 `surface_fields` (p and the three wall-shear components; only p is used),
 `surface_normals`, `volume_sdf` and `volume_sdf_grad` (distance to the
 CFD geometry and its gradient). Set `data.raw_pt_dir` in `config.yaml` or
-pass `--raw-dir`. The format is specified in
-[`docs/cfd_case_format.md`](docs/cfd_case_format.md), and
-`convert_cfd_case.py` produces it from VTK files.
+pass `--raw-dir`. `npz_to_raw.py` produces these files from CFD cases in
+the dataset's NPZ format ([Preprocessing your own
+cases](#preprocessing-your-own-cases)).
 
 **Preprocessing** turns the raw cases into one pack per estate:
 
@@ -143,7 +143,9 @@ python main.py preprocess --norm-stats path/to/norm_stats.json
 
 - Pass 1 extracts each estate's building footprints from its surface
   points: DBSCAN clusters, concave hulls, simplification.
-- A filter drops non-finite and anomalous cases.
+- A filter drops non-finite and anomalous cases. The anomaly part compares
+  statistics over every case in the folder; with fewer than a few hundred
+  cases pass `--no-anomaly-filter`.
 - Pass 2 computes the per-point features of the Method section and the
   latent layout.
 
@@ -328,30 +330,63 @@ outside it:
   Other inflow speeds, terrain, non-extruded building shapes and geometry
   above 160 m are outside what it was trained on.
 
-### Running on your own CFD case
+### Preprocessing your own cases
 
-`convert_cfd_case.py` turns a CFD case into a raw case file of the
-dataset's format, `<estate>_<dir>.pt`, and `predict_new_case.py --raw-pt`
-predicts at that file's points and scores the prediction against its CFD
-fields:
+Everything starts from CFD cases stored in the dataset's NPZ format: one
+file per case and wind direction, `<estate>_<dir>.npz` with dir in N, E,
+S, W. Whatever produced the CFD, a file with these keys goes through the
+whole pipeline.
+
+| key | shape, dtype | content |
+|---|---|---|
+| `volume_mesh_centers` | [N, 3] float32 | the vertices of the CFD volume mesh, whole domain, metres |
+| `volume_fields` | [N, 5] float32 | U<sub>x</sub>, U<sub>y</sub>, U<sub>z</sub> divided by U<sub>REF</sub>; p / (ρ U<sub>REF</sub>²); ν<sub>t</sub> / (U<sub>REF</sub> L), at the vertices |
+| `surface_mesh_centers` | [S, 3] float32 | face centres of the building wall patches, metres |
+| `surface_normals` | [S, 3] float32 | unit face normals, pointing into the buildings |
+| `surface_areas` | [S] float32 | face areas, m² |
+| `surface_fields` | [S, 4] float32 | p / (ρ U<sub>REF</sub>²), then the wall shear stress x, y, z / (ρ U<sub>REF</sub>²) |
+| `stl_coordinates` | [V, 3] float32 | vertices of the building STL, metres |
+| `stl_faces` | [3F] float32 (flat) or [F, 3] | triangle vertex indices |
+| `stl_centers`, `stl_areas` | [F, 3], [F] float32 | triangle centres and areas |
+| `global_params_values`, `global_params_reference` | [2] float32 | [U<sub>REF</sub>, ρ] = [2.0, 1.225] |
+| `filename` | str | the case name |
+
+Conventions: the frame is the model frame (origin at the centre of the
+estate, ground at z = 0, mean wind toward −y); U<sub>REF</sub> = 2 m/s,
+ρ = 1.225 kg/m³, L = the largest side of the STL bounding box; p is the
+kinematic pressure of a run with gravity (the hydrostatic term included);
+the four directions of an estate are the same mesh rotated by quarter
+turns, point for point. The files may hold the whole CFD domain; the
+conversion crops them to the learning region.
+
+Two commands turn a folder of such files into the training packs:
 
 ```bash
-python convert_cfd_case.py --volume case/internal.vtu --surface case/boundary/buildings.vtp --stl case/buildings.stl --estate my_estate --direction N --out raw
+python npz_to_raw.py --npz-dir path/to/npz --out data/raw --workers 8
 ```
 
 ```bash
-python predict_new_case.py --raw-pt raw/my_estate_N.pt --weights path/to/weights --out outputs
+python main.py preprocess --norm-stats path/to/norm_stats.json --raw-dir data/raw --no-anomaly-filter
 ```
 
-The converter needs the internal mesh with cell data U, p and ν<sub>t</sub>,
-the building wall patches with cell data p and wallShearStress, and a
-watertight STL of the buildings. It averages the cell values onto the mesh
-vertices, crops to the learning region, rotates the wind to −y, brings the
-pressure to the training convention, orients the wall normals, computes the
-signed distance to the STL and checks units and conventions.
-[`docs/cfd_case_format.md`](docs/cfd_case_format.md) specifies the input
-files, the output file and every convention, and how a folder of converted
-cases becomes training data.
+`npz_to_raw.py` writes one raw case file per NPZ: physical units, the
+learning-region crop, outward surface normals and the signed distance to
+the STL (Open3D), with the recipe the dataset was made with. Checked
+against the dataset's own packs, the positions, the distance field, the ray
+distances and the volume region codes come out identical and the targets
+agree to float32 rounding. `main.py preprocess` then builds one pack per
+estate as described under [Running the
+experiments](#running-the-experiments); pass the released `norm_stats.json`
+to keep the targets on the trained model's scale. `--no-anomaly-filter`
+skips the cross-case anomaly filter, which only makes sense with hundreds
+of cases.
+
+To score the trained model on one converted case, predict at its points
+and compare with its CFD fields:
+
+```bash
+python predict_new_case.py --raw-pt data/raw/<estate>_<dir>.pt --weights path/to/weights --out outputs
+```
 
 ---
 
@@ -360,7 +395,7 @@ cases becomes training data.
 ```
 main.py                  preprocess / releaf / manifest / derive / train / post
 predict_new_case.py      new estate or raw case file -> features -> IBO -> outputs, metrics
-convert_cfd_case.py      CFD case (VTK files + STL) -> raw case file <estate>_<dir>.pt
+npz_to_raw.py            CFD cases in the dataset's NPZ format -> raw case files <estate>_<dir>.pt
 config.yaml              main-table setting of every model
 src/
   preprocess/            geometry (2.5D buildings), kdtree, features, build (dataset packs)
@@ -372,7 +407,6 @@ src/
   manifest.py            pool manifests (splits)
   registry.py            the --model menu
 examples/toy_estate.json example input for predict_new_case.py
-docs/cfd_case_format.md  the raw case file, the VTK inputs and the conversion
 Demo/                    IBO prediction figures from the paper (PDF and PNG)
 tools/                   wall-distance bins, stage timing
 tests/                   numerical equivalence tests

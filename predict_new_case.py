@@ -26,7 +26,7 @@ Two kinds of input:
             its edge. The points are placed like the CFD mesh's.
 
 --raw-pt    a raw UrbanWind case file (<estate>_<dir>.pt: the output of
-            convert_cfd_case.py, or a file of the dataset). The prediction
+            npz_to_raw.py, or a file of the dataset). The prediction
             is made at the file's own points, with the building footprints
             extracted from its surface points as the dataset preprocessing
             does, and scored against the file's CFD fields.

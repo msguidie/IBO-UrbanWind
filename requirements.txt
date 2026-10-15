@@ -5,7 +5,5 @@ scikit-learn>=1.3
 shapely>=2.0
 PyYAML>=6.0
 psutil>=5.9
-# convert_cfd_case.py: VTK input, STL handling, distance field
-pyvista>=0.43
-trimesh>=4.0
-libigl>=2.5
+# npz_to_raw.py: signed distance to the building STL
+open3d>=0.18

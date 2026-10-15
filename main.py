@@ -442,6 +442,11 @@ def cmd_preprocess(args) -> int:
     _apply_work_dir(cfg, args)
     if args.raw_dir:
         cfg.data.raw_pt_dir = str(Path(args.raw_dir).expanduser())
+    if args.no_anomaly_filter:
+        # the cross-case MAD filter compares every case in the folder; with
+        # a handful of cases it drops whole estates for nothing
+        cfg.preprocess.anomaly_concordance_threshold = float("inf")
+        cfg.preprocess.anomaly_extreme_threshold = float("inf")
     _apply_grid(cfg, args)
     cfg.validate()
     cfg.resolve_paths()
@@ -659,6 +664,10 @@ def main() -> int:
                         "constants); copied into the cache")
     p.add_argument("--raw-dir", default=None,
                    help="override data.raw_pt_dir")
+    p.add_argument("--no-anomaly-filter", action="store_true",
+                   help="skip the cross-case anomaly filter of the stage; it "
+                        "compares statistics over every case in the folder "
+                        "and needs hundreds of them to be meaningful")
     _add_cache_flags(p, with_manifest=False)
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_preprocess)
